@@ -170,21 +170,40 @@ async def send_tweet(tweet, message, caption, spoiler, glue, reply: bool = False
                 )
             )
         else:
-            sent = (
-                await message.answer_video(
-                    video=video_url,
-                    caption=caption,
-                    has_spoiler=spoiler,
-                    parse_mode=ParseMode.HTML,
+            try:
+                sent = (
+                    await message.answer_video(
+                        video=video_url,
+                        caption=caption,
+                        has_spoiler=spoiler,
+                        parse_mode=ParseMode.HTML,
+                    )
+                    if not reply
+                    else await message.reply_video(
+                        video=video_url,
+                        caption=caption,
+                        has_spoiler=spoiler,
+                        parse_mode=ParseMode.HTML,
+                    )
                 )
-                if not reply
-                else await message.reply_video(
-                    video=video_url,
-                    caption=caption,
-                    has_spoiler=spoiler,
-                    parse_mode=ParseMode.HTML,
+            except TelegramBadRequest:
+                video = await fetch_bytes(video_url)
+                sent = (
+                    await message.answer_video(
+                        video=BufferedInputFile(video, filename='video.mp4'),
+                        caption=caption,
+                        has_spoiler=spoiler,
+                        parse_mode=ParseMode.HTML,
+                    )
+                    if not reply
+                    else await message.reply_video(
+                        video=BufferedInputFile(video, filename='video.mp4'),
+                        caption=caption,
+                        has_spoiler=spoiler,
+                        parse_mode=ParseMode.HTML,
+                    )
                 )
-            )
+
     elif tweet.get('media', {}).get('photos', []):
         if glue and len(tweet['media']['photos']) > 1:
             urls = [photo['url'] for photo in tweet['media']['photos']]
@@ -228,16 +247,20 @@ async def send_tweet(tweet, message, caption, spoiler, glue, reply: bool = False
                 )
             except TelegramBadRequest:
                 photo = await fetch_bytes(tweet['media']['photos'][0]['url'])
-                await message.answer_photo(
-                    BufferedInputFile(photo, filename='image.jpeg'),
-                    caption=caption,
-                    has_spoiler=spoiler,
-                    parse_mode=ParseMode.HTML,
-                ) if not reply else await message.reply_photo(
-                    BufferedInputFile(photo, filename='image.jpeg'),
-                    caption=caption,
-                    has_spoiler=spoiler,
-                    parse_mode=ParseMode.HTML,
+                sent = (
+                    await message.answer_photo(
+                        BufferedInputFile(photo, filename='image.jpeg'),
+                        caption=caption,
+                        has_spoiler=spoiler,
+                        parse_mode=ParseMode.HTML,
+                    )
+                    if not reply
+                    else await message.reply_photo(
+                        BufferedInputFile(photo, filename='image.jpeg'),
+                        caption=caption,
+                        has_spoiler=spoiler,
+                        parse_mode=ParseMode.HTML,
+                    )
                 )
 
     else:
