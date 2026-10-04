@@ -1,6 +1,5 @@
 import asyncio
 import html
-import random
 import re
 from io import BytesIO
 
@@ -16,7 +15,14 @@ router = Router()
 
 
 async def get_twitter_data(tweet: str, max_retries: int = 2, delay: float = 1.0):
-    api_url = tweet.replace('https://x.com', 'https://api.fxtwitter.com')
+    twitter_pattern = r'https://(?:www\.)?(?:x|twitter)\.com/[\w+]+/status/(\d+)'
+    find = re.findall(twitter_pattern, tweet, re.IGNORECASE)
+    print(find)
+    if find:
+        api_url = f'https://api.fxtwitter.com/2/status/{find[0]}'
+    else:
+        return None
+    print(api_url)
     timeout = aiohttp.ClientTimeout(total=10)
     async with aiohttp.ClientSession(timeout=timeout) as session:
         for attempt in range(max_retries + 1):
@@ -25,7 +31,9 @@ async def get_twitter_data(tweet: str, max_retries: int = 2, delay: float = 1.0)
                     if response.status == 200:
                         return await response.json()
                     if 400 <= response.status < 500 and response.status != 429:
-                        return None
+                        data = await response.json()
+
+                        return data.get('message')
             except (aiohttp.ClientError, asyncio.TimeoutError):
                 pass
             if attempt < max_retries:
@@ -284,28 +292,14 @@ async def send_tweet(tweet, message, caption, spoiler, glue, reply: bool = False
 async def fixing_twitter_links(message: Message):
     message_text = message.text
     message_text = message_text.strip()
-    pattern = r'(?<!\S)([dDдД](\d+))(?!\S)'
-    search = re.search(pattern, message_text)
-    if search and message.from_user.id != 8636035849 and not message.forward_from:
-        number = int(search.groups()[1])
-        number = min(number, 9999)
-        number = max(number, 2)
-        message_text = f'<code>(d{number})</code>: {random.randint(1, number)}'
-        await message.reply(message_text)
-        return
     message_text = message_text.split()
+    # or 'https://bsky.app' in message_text[0]:
     if 'https://x.com' in message_text[0]:
         link = message_text[0]
-        pos = link.find('/video/')
-        if pos != -1:
-            link = link[:pos]
-        pos = link.find('/photo/')
-        if pos != -1:
-            link = link[:pos]
         response = await get_twitter_data(link)
         if not response:
             return
-        tweet = response['tweet']
+        tweet = response['status']
         spoiler = False
         glue = False
         reply = False

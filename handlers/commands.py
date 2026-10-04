@@ -7,4 +7,4 @@ router = Router()
 
 @router.message(CommandStart())
 async def hello(message: Message) -> None:
-    await message.answer(f'Fuck you, {message.from_user.first_name}!')
+    await message.answer(f'Hello, {message.from_user.first_name}!')
