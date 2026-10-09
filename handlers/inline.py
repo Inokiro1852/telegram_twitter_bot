@@ -1,3 +1,6 @@
+import logging
+import re
+
 from aiogram import Bot, Router
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.types import (
@@ -19,150 +22,58 @@ from config import config
 
 router = Router()
 
+twitter_pattern = r'https://(?:www\.)?(?:x|twitter)\.com/[\w]+/status/(\d+)'
+bluesky_pattern = r'https://(?:www\.)?bsky\.app/profile/([\w\-\.]+)/post/(\w+)'
+
+
+logger = logging.getLogger(__name__)
+
+DEFAULT_VARIANTS = [
+    ('none', 'default'),
+    ('s', 'with spoiler'),
+    ('r', 'with reply'),
+    ('sr', 'with spoiler and reply'),
+]
+
+REVERSE_VARIANTS = [
+    ('rr', 'with reversed reply'),
+    ('srr', 'with spoiler and reversed reply'),
+]
+
 
 @router.inline_query()
 async def handle_all_inline_query(inline_query: InlineQuery) -> None:
     query = inline_query.query.strip()
     results = []
-    reply_markup = None
 
-    if 'https://x.com/' in query:
-        results.clear()
-        link = query.strip()
-        link = link.split()
+    if re.match(twitter_pattern, query, re.IGNORECASE) or re.match(
+        bluesky_pattern, query, re.IGNORECASE
+    ):
+        parts = query.split()
         message_text = '<i>Fetching tweet</i>'
         button_text = 'Fetching tweet...'
+        reversed_mode = len(parts) > 1 and parts[1] in ('r', 'р')
+        variants = REVERSE_VARIANTS if reversed_mode else DEFAULT_VARIANTS
 
-        if len(link) > 1 and (link[1] == 'r' or link[1] == 'р'):
-            result_id = 'rr'
-            reply_markup = InlineKeyboardMarkup(
-                inline_keyboard=[
-                    [
-                        InlineKeyboardButton(
-                            text=button_text,
-                            callback_data='loading',
-                        )
-                    ]
-                ]
-            )
+        for result_id, description in variants:
             results.append(
                 InlineQueryResultArticle(
                     id=result_id,
                     title='Fetch tweet',
-                    description='with reversed reply',
+                    description=description,
                     input_message_content=InputTextMessageContent(
                         message_text=message_text,
                     ),
-                    reply_markup=reply_markup,
-                )
-            )
-
-            result_id = 'srr'
-            reply_markup = InlineKeyboardMarkup(
-                inline_keyboard=[
-                    [
-                        InlineKeyboardButton(
-                            text=button_text,
-                            callback_data='loading',
-                        )
-                    ]
-                ]
-            )
-            results.append(
-                InlineQueryResultArticle(
-                    id=result_id,
-                    title='Fetch tweet',
-                    description='with spoiler and reversed reply',
-                    input_message_content=InputTextMessageContent(
-                        message_text=message_text,
+                    reply_markup=InlineKeyboardMarkup(
+                        inline_keyboard=[
+                            [
+                                InlineKeyboardButton(
+                                    text=button_text,
+                                    callback_data='loading',
+                                )
+                            ]
+                        ]
                     ),
-                    reply_markup=reply_markup,
-                )
-            )
-        else:
-            result_id = 'none'
-            reply_markup = InlineKeyboardMarkup(
-                inline_keyboard=[
-                    [InlineKeyboardButton(text=button_text, callback_data='loading')]
-                ]
-            )
-            results.append(
-                InlineQueryResultArticle(
-                    id=result_id,
-                    title='Fetch tweet',
-                    description='default',
-                    input_message_content=InputTextMessageContent(
-                        message_text=message_text,
-                    ),
-                    reply_markup=reply_markup,
-                )
-            )
-            result_id = 's'
-            reply_markup = InlineKeyboardMarkup(
-                inline_keyboard=[
-                    [
-                        InlineKeyboardButton(
-                            text=button_text,
-                            callback_data='loading',
-                        )
-                    ]
-                ]
-            )
-            results.append(
-                InlineQueryResultArticle(
-                    id=result_id,
-                    title='Fetch tweet',
-                    description='with spoiler',
-                    input_message_content=InputTextMessageContent(
-                        message_text=message_text,
-                    ),
-                    reply_markup=reply_markup,
-                )
-            )
-
-            result_id = 'r'
-            reply_markup = InlineKeyboardMarkup(
-                inline_keyboard=[
-                    [
-                        InlineKeyboardButton(
-                            text=button_text,
-                            callback_data='loading',
-                        )
-                    ]
-                ]
-            )
-            results.append(
-                InlineQueryResultArticle(
-                    id=result_id,
-                    title='Fetch tweet',
-                    description='with reply',
-                    input_message_content=InputTextMessageContent(
-                        message_text=message_text,
-                    ),
-                    reply_markup=reply_markup,
-                )
-            )
-
-            result_id = 'sr'
-            reply_markup = InlineKeyboardMarkup(
-                inline_keyboard=[
-                    [
-                        InlineKeyboardButton(
-                            text=button_text,
-                            callback_data='loading',
-                        )
-                    ]
-                ]
-            )
-            results.append(
-                InlineQueryResultArticle(
-                    id=result_id,
-                    title='Fetch tweet',
-                    description='with spoiler and reply',
-                    input_message_content=InputTextMessageContent(
-                        message_text=message_text,
-                    ),
-                    reply_markup=reply_markup,
                 )
             )
 
@@ -173,8 +84,11 @@ async def handle_all_inline_query(inline_query: InlineQuery) -> None:
     )
 
 
-async def send_tweet(bot, message_id, tweet, caption, spoiler, reply, reverse_reply):
+async def send_tweet(
+    bot, message_id, tweet, caption, spoiler, reply, reverse_reply, reply_link
+):
     reply_markup = None
+    # Dumping media with spoiler is needed, because telegram doesn't want to do it without hashing first
     if reply and tweet.get('quote', {}):
         link = tweet.get('quote', {}).get('url')
         reply_markup = InlineKeyboardMarkup(
@@ -187,7 +101,7 @@ async def send_tweet(bot, message_id, tweet, caption, spoiler, reply, reverse_re
             ]
         )
     elif reverse_reply:
-        link = reverse_reply
+        link = reply_link
         reply_markup = InlineKeyboardMarkup(
             inline_keyboard=[
                 [
@@ -214,13 +128,38 @@ async def send_tweet(bot, message_id, tweet, caption, spoiler, reply, reverse_re
             )
             if spoiler:
                 await bot.send_video(config.dump_chat_id, video_info['url'])
-            await bot.edit_message_media(
-                media=video, inline_message_id=message_id, reply_markup=reply_markup
-            )
+            try:
+                await bot.edit_message_media(
+                    media=video, inline_message_id=message_id, reply_markup=reply_markup
+                )
+            except TelegramBadRequest:
+                logger.info('Bad Request')
+                video_bytes = await twitter.fetch_bytes(video_info['url'])
+                if not video_bytes:
+                    await bot.edit_message_text(
+                        text='Some error occurred',
+                        inline_message_id=message_id,
+                    )
+                    return
+                msg = await bot.send_video(
+                    config.dump_chat_id, BufferedInputFile(video_bytes, 'video.mp4')
+                )
+                video = InputMediaVideo(
+                    media=msg.video.file_id, caption=caption, has_spoiler=spoiler
+                )
+                await bot.edit_message_media(
+                    media=video, inline_message_id=message_id, reply_markup=reply_markup
+                )
     elif tweet.get('media', {}).get('photos', []):
         if len(tweet['media']['photos']) > 1:
             urls = [photo['url'] for photo in tweet['media']['photos']]
             glued_img_buffer = await twitter.glue_images(urls)
+            if not glued_img_buffer:
+                await bot.edit_message_text(
+                    text='Some error occurred',
+                    inline_message_id=message_id,
+                )
+                return
             buffered_img = BufferedInputFile(
                 glued_img_buffer.getvalue(), filename='image.jpeg'
             )
@@ -235,7 +174,7 @@ async def send_tweet(bot, message_id, tweet, caption, spoiler, reply, reverse_re
                 media=photo_url, caption=caption, has_spoiler=spoiler
             )
         try:
-            if spoiler:
+            if spoiler and not len(tweet['media']['photos']) > 1:
                 await bot.send_photo(config.dump_chat_id, photo_url)
             await bot.edit_message_media(
                 media=photo_input,
@@ -243,9 +182,13 @@ async def send_tweet(bot, message_id, tweet, caption, spoiler, reply, reverse_re
                 reply_markup=reply_markup,
             )
         except TelegramBadRequest:
+            logger.info('Bad Request')
             photo = await twitter.fetch_bytes(tweet['media']['photos'][0]['url'])
+            msg = await bot.send_photo(
+                config.dump_chat_id, BufferedInputFile(photo, 'image.jpeg')
+            )
             photo_input = InputMediaPhoto(
-                media=BufferedInputFile(photo, filename='image.jpeg'),
+                media=msg.photo[-1].file_id,
                 caption=caption,
                 has_spoiler=spoiler,
             )
@@ -267,57 +210,38 @@ async def send_tweet(bot, message_id, tweet, caption, spoiler, reply, reverse_re
 async def inline_result(chosen_result: ChosenInlineResult, bot: Bot):
     if not chosen_result.inline_message_id:
         return
-    elif chosen_result.query.startswith('https://x.com/'):
-        link = chosen_result.query.strip()
-        link = link.split()[0]
-        pos = link.find('/video/')
-        if pos != -1:
-            link = link[:pos]
-        pos = link.find('/photo/')
-        if pos != -1:
-            link = link[:pos]
-        data = chosen_result.result_id
-        spoiler = False
-        reply = False
-        reverse_reply = False
-        if data == 's':
-            spoiler = True
-        elif data == 'r':
-            reply = True
-        elif data == 'sr':
-            spoiler = True
-            reply = True
-        elif data == 'rr':
-            reply = True
-            reverse_reply = True
-        elif data == 'srr':
-            reply = True
-            reverse_reply = True
-            spoiler = True
+    query = chosen_result.query.strip()
+    link_match = re.match(twitter_pattern, query, re.IGNORECASE) or re.match(
+        bluesky_pattern, query, re.IGNORECASE
+    )
+    if not link_match:
+        return
+    link = link_match.group(0)
+    data = chosen_result.result_id
+
+    spoiler = data in ('s', 'sr', 'srr')
+    reply = data in ('r', 'sr')
+    reverse_reply = data in ('rr', 'srr')
+    try:
         response = await twitter.get_twitter_data(link)
-        if response and not isinstance(response, str):
-            tweet = response['status']
-        elif response and isinstance(response, str):
-            await bot.edit_message_text(
-                text=f'Error: {response}',
-                inline_message_id=chosen_result.inline_message_id,
-            )
-            return
-        else:
+        if not response or 'status' not in response:
             await bot.edit_message_text(
                 text='Some error occurred',
                 inline_message_id=chosen_result.inline_message_id,
             )
             return
+        tweet = response['status']
+        reply_link = ''
         if not tweet.get('quote'):
             reverse_reply = False
         if reverse_reply and tweet.get('quote'):
-            reverse_reply = link
+            reply_link = link
             tweet = tweet.get('quote')
             link = tweet.get('url')
             caption = await twitter.get_tweet_caption(tweet, link, spoiler)
         else:
             caption = await twitter.get_tweet_caption(tweet, link, spoiler)
+
         await send_tweet(
             bot,
             chosen_result.inline_message_id,
@@ -326,4 +250,11 @@ async def inline_result(chosen_result: ChosenInlineResult, bot: Bot):
             spoiler,
             reply,
             reverse_reply,
+            reply_link,
+        )
+    except Exception:
+        logger.error('Some error occurred.')
+        await bot.edit_message_text(
+            text='Some error occurred.',
+            inline_message_id=chosen_result.inline_message_id,
         )

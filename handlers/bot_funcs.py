@@ -1,28 +1,35 @@
 import asyncio
 import html
+import logging
 import re
 from io import BytesIO
 
 import aiohttp
 from aiogram import F, Router
 from aiogram.enums import ParseMode
-from aiogram.exceptions import TelegramBadRequest
+from aiogram.exceptions import TelegramAPIError, TelegramBadRequest
 from aiogram.types import BufferedInputFile, LinkPreviewOptions, Message
 from aiogram.utils.media_group import MediaGroupBuilder
 from PIL import Image
 
 router = Router()
 
+logger = logging.getLogger(__name__)
+
+
+twitter_pattern = r'https://(?:www\.)?(?:x|twitter)\.com/[\w]+/status/(\d+)'
+bluesky_pattern = r'https://(?:www\.)?bsky\.app/profile/([\w\-\.]+)/post/(\w+)'
+
 
 async def get_twitter_data(tweet: str, max_retries: int = 2, delay: float = 1.0):
-    twitter_pattern = r'https://(?:www\.)?(?:x|twitter)\.com/[\w+]+/status/(\d+)'
-    find = re.findall(twitter_pattern, tweet, re.IGNORECASE)
-    print(find)
-    if find:
-        api_url = f'https://api.fxtwitter.com/2/status/{find[0]}'
+    find_twitter = re.match(twitter_pattern, tweet, re.IGNORECASE)
+    find_bluesky = re.match(bluesky_pattern, tweet, re.IGNORECASE)
+    if find_twitter:
+        api_url = f'https://api.fxtwitter.com/2/status/{find_twitter.group(1)}'
+    elif find_bluesky:
+        api_url = f'https://api.fxbsky.app/2/status/{find_bluesky.group(1)}/{find_bluesky.group(2)}'
     else:
         return None
-    print(api_url)
     timeout = aiohttp.ClientTimeout(total=10)
     async with aiohttp.ClientSession(timeout=timeout) as session:
         for attempt in range(max_retries + 1):
@@ -31,9 +38,7 @@ async def get_twitter_data(tweet: str, max_retries: int = 2, delay: float = 1.0)
                     if response.status == 200:
                         return await response.json()
                     if 400 <= response.status < 500 and response.status != 429:
-                        data = await response.json()
-
-                        return data.get('message')
+                        return None
             except (aiohttp.ClientError, asyncio.TimeoutError):
                 pass
             if attempt < max_retries:
@@ -41,13 +46,17 @@ async def get_twitter_data(tweet: str, max_retries: int = 2, delay: float = 1.0)
     return None
 
 
-async def get_tweet_caption(tweet, link, spoiler):
+async def get_tweet_caption(tweet, link, spoiler, limit=1024):
     text = tweet.get('text') or ''
     text_range = tweet.get('raw_text', {}).get('display_text_range')
     if text_range:
         text = text[text_range[0] :]
+    author_name = tweet.get('author', {}).get('name') or ''
+    budget = limit - len(author_name) - 20
+    if len(text) > budget:
+        text = text[: budget - 1] + '...'
     text = html.escape(text)
-    author_name = tweet.get('author', {}).get('name')
+    author_name = html.escape(author_name)
     caption = (
         (
             f'{author_name}:\n<tg-spoiler>{text}</tg-spoiler>\n\n<a href="{link}">link</a>'
@@ -64,7 +73,7 @@ async def get_tweet_caption(tweet, link, spoiler):
     return caption
 
 
-def __stitch_images(image_data_list):
+def _stitch_images(image_data_list):
     images = [Image.open(BytesIO(data)).convert('RGB') for data in image_data_list]
     if not images:
         return
@@ -93,7 +102,7 @@ def __stitch_images(image_data_list):
 
     max_dimension = 10000
     max_size = 10 * 1024 * 1024
-    quality = 100
+    quality = 95
     width, height = glued_img.size
 
     if width + height >= max_dimension:
@@ -117,23 +126,14 @@ def __stitch_images(image_data_list):
     return output
 
 
-async def glue_images(links) -> BytesIO:
-    if isinstance(links, list) and len(links) > 1:
-        async with aiohttp.ClientSession() as session:
-            tasks = [session.get(url) for url in links]
-            responses = await asyncio.gather(*tasks)
-
-            image_data_list = []
-            for resp in responses:
-                if isinstance(resp, aiohttp.ClientResponse) and resp.status == 200:
-                    image_data_list.append(await resp.read())
-
-        if not image_data_list:
-            return None
-
-        return await asyncio.to_thread(__stitch_images, image_data_list)
-    else:
+async def glue_images(links) -> BytesIO | None:
+    if not isinstance(links, list) or len(links) < 2:
         return None
+    results = await asyncio.gather(*(fetch_bytes(link) for link in links))
+    image_data_list = [data for data in results if data]
+    if not image_data_list or len(image_data_list) != len(links):
+        return None
+    return await asyncio.to_thread(_stitch_images, image_data_list)
 
 
 async def fetch_bytes(link: str, retries: int = 2) -> bytes:
@@ -149,143 +149,125 @@ async def fetch_bytes(link: str, retries: int = 2) -> bytes:
             except (aiohttp.ClientError, asyncio.TimeoutError):
                 pass
             if attempt < retries:
-                asyncio.sleep(attempt + 1)
+                await asyncio.sleep(attempt + 1)
 
     return None
 
 
 async def send_tweet(tweet, message, caption, spoiler, glue, reply: bool = False):
-    if isinstance(message, list):
-        message = message[0]
-    sent = None
+    answer_animation = message.reply_animation if reply else message.answer_animation
+    answer_video = message.reply_video if reply else message.answer_video
+    answer_photo = message.reply_photo if reply else message.answer_photo
+    answer_media_group = (
+        message.reply_media_group if reply else message.answer_media_group
+    )
+    answer_text = message.reply if reply else message.answer
+
     if tweet.get('media', {}).get('videos', []):
         video_info = tweet['media']['videos'][0]
         video_url = video_info['url']
         if video_info.get('type') == 'gif':
-            sent = (
-                await message.answer_animation(
-                    animation=video_url,
-                    caption=caption,
-                    has_spoiler=spoiler,
-                    parse_mode=ParseMode.HTML,
-                )
-                if not reply
-                else await message.reply_animation(
-                    animation=video_url,
-                    caption=caption,
-                    has_spoiler=spoiler,
-                    parse_mode=ParseMode.HTML,
-                )
-            )
-        else:
             try:
-                sent = (
-                    await message.answer_video(
-                        video=video_url,
-                        caption=caption,
-                        has_spoiler=spoiler,
-                        parse_mode=ParseMode.HTML,
-                    )
-                    if not reply
-                    else await message.reply_video(
-                        video=video_url,
-                        caption=caption,
-                        has_spoiler=spoiler,
-                        parse_mode=ParseMode.HTML,
-                    )
+                sent = await answer_animation(
+                    animation=video_url,
+                    caption=caption,
+                    has_spoiler=spoiler,
+                    parse_mode=ParseMode.HTML,
                 )
             except TelegramBadRequest:
-                video = await fetch_bytes(video_url)
-                sent = (
-                    await message.answer_video(
-                        video=BufferedInputFile(video, filename='video.mp4'),
-                        caption=caption,
-                        has_spoiler=spoiler,
-                        parse_mode=ParseMode.HTML,
-                    )
-                    if not reply
-                    else await message.reply_video(
-                        video=BufferedInputFile(video, filename='video.mp4'),
-                        caption=caption,
-                        has_spoiler=spoiler,
-                        parse_mode=ParseMode.HTML,
-                    )
+                logger.info('BAD REQUEST')
+                fetched_video = await fetch_bytes(video_url)
+                if not fetched_video:
+                    await message.reply('Some error occurred.')
+                    return
+                sent = await answer_video(
+                    video=BufferedInputFile(fetched_video, filename='video.mp4'),
+                    caption=caption,
+                    has_spoiler=spoiler,
+                    parse_mode=ParseMode.HTML,
+                )
+        else:
+            try:
+                sent = await answer_video(
+                    video=video_url,
+                    caption=caption,
+                    has_spoiler=spoiler,
+                    parse_mode=ParseMode.HTML,
+                )
+            except TelegramBadRequest:
+                logger.info('BAD REQUEST')
+                fetched_video = await fetch_bytes(video_url)
+                if not fetched_video:
+                    await message.reply('Some error occurred.')
+                    return
+                sent = await answer_video(
+                    video=BufferedInputFile(fetched_video, filename='video.mp4'),
+                    caption=caption,
+                    has_spoiler=spoiler,
+                    parse_mode=ParseMode.HTML,
                 )
 
     elif tweet.get('media', {}).get('photos', []):
+        urls = [photo['url'] for photo in tweet['media']['photos']]
         if glue and len(tweet['media']['photos']) > 1:
-            urls = [photo['url'] for photo in tweet['media']['photos']]
             glued_img_buffer = await glue_images(urls)
-            input_img = BufferedInputFile(
-                glued_img_buffer.getvalue(), filename='image.jpeg'
-            )
-            sent = (
-                await message.answer_photo(
+            if glued_img_buffer:
+                input_img = BufferedInputFile(
+                    glued_img_buffer.getvalue(), filename='image.jpeg'
+                )
+                sent = await answer_photo(
                     photo=input_img,
                     caption=caption,
                     has_spoiler=spoiler,
                     parse_mode=ParseMode.HTML,
                 )
-                if not reply
-                else await message.reply_photo(
-                    photo=input_img,
-                    caption=caption,
-                    has_spoiler=spoiler,
+            else:
+                sent = await answer_text(
+                    text=caption,
                     parse_mode=ParseMode.HTML,
+                    link_preview_options=LinkPreviewOptions(is_disabled=True),
                 )
-            )
         else:
-            media_builder = MediaGroupBuilder(caption=caption)
-            for photo in tweet['media']['photos']:
-                media_builder.add_photo(
-                    media=photo['url'],
-                    has_spoiler=spoiler,
-                )
+
+            def build_album(photos, caption, spoiler):
+                builder = MediaGroupBuilder(caption=caption)
+                for photo in photos:
+                    builder.add_photo(
+                        media=photo,
+                        has_spoiler=spoiler,
+                        parse_mode=ParseMode.HTML,
+                    )
+                return builder.build()
+
             try:
-                sent = (
-                    await message.answer_media_group(
-                        media=media_builder.build(),
-                        parse_mode=ParseMode.HTML,
-                    )
-                    if not reply
-                    else await message.reply_media_group(
-                        media=media_builder.build(),
-                        parse_mode=ParseMode.HTML,
-                    )
+                sent = await answer_media_group(
+                    media=build_album(urls, caption, spoiler),
                 )
             except TelegramBadRequest:
-                photo = await fetch_bytes(tweet['media']['photos'][0]['url'])
-                sent = (
-                    await message.answer_photo(
-                        BufferedInputFile(photo, filename='image.jpeg'),
-                        caption=caption,
-                        has_spoiler=spoiler,
-                        parse_mode=ParseMode.HTML,
-                    )
-                    if not reply
-                    else await message.reply_photo(
-                        BufferedInputFile(photo, filename='image.jpeg'),
-                        caption=caption,
-                        has_spoiler=spoiler,
-                        parse_mode=ParseMode.HTML,
-                    )
+                logger.info('BAD REQUEST')
+                fetched_photos = await asyncio.gather(
+                    *(fetch_bytes(url) for url in urls)
+                )
+                files = [
+                    BufferedInputFile(file=photo, filename=f'photo_{i}.jpeg')
+                    for i, photo in enumerate(fetched_photos)
+                    if photo
+                ]
+                if not files:
+                    await message.reply('Some error occurred.')
+                    return
+
+                sent = await answer_media_group(
+                    media=build_album(files, caption, spoiler),
                 )
 
     else:
-        sent = (
-            await message.answer(
-                text=caption,
-                parse_mode=ParseMode.HTML,
-                link_preview_options=LinkPreviewOptions(is_disabled=True),
-            )
-            if not reply
-            else await message.reply(
-                text=caption,
-                parse_mode=ParseMode.HTML,
-                link_preview_options=LinkPreviewOptions(is_disabled=True),
-            )
+        sent = await answer_text(
+            text=caption,
+            parse_mode=ParseMode.HTML,
+            link_preview_options=LinkPreviewOptions(is_disabled=True),
         )
-    return sent
+    return sent[0] if isinstance(sent, list) else sent
 
 
 @router.message(F.text)
@@ -293,42 +275,47 @@ async def fixing_twitter_links(message: Message):
     message_text = message.text
     message_text = message_text.strip()
     message_text = message_text.split()
-    # or 'https://bsky.app' in message_text[0]:
-    if 'https://x.com' in message_text[0]:
-        link = message_text[0]
-        response = await get_twitter_data(link)
-        if not response:
+    link = message_text[0]
+    link_match = re.match(twitter_pattern, link, re.IGNORECASE) or re.match(
+        bluesky_pattern, link, re.IGNORECASE
+    )
+    if not link_match:
+        return
+    link = link_match.group(0)
+    parameters = [parameter.lower() for parameter in message_text[1:]]
+    logger.info(parameters)
+    response = await get_twitter_data(link)
+    # logger.info(response)
+    if not response or 'status' not in response:
+        await message.reply('Some error occurred.')
+        return
+    tweet = response['status']
+    spoiler = any(parameter in ('s', 'с') for parameter in parameters)
+    glue = any(parameter in ('g', 'к') for parameter in parameters)
+    reply = any(parameter in ('r', 'р') for parameter in parameters)
+    reverse_reply = any(parameter in ('rr', 'рр') for parameter in parameters)
+    if reverse_reply and tweet.get('quote', {}):
+        tweet_reply = tweet.get('quote', {})
+        link2 = tweet.get('quote', {}).get('url')
+        caption = await get_tweet_caption(tweet_reply, link2, spoiler)
+        sent = await send_tweet(
+            tweet_reply, message, caption, spoiler, glue, reply=False
+        )
+        if not sent:
             return
-        tweet = response['status']
-        spoiler = False
-        glue = False
-        reply = False
-        reverse_reply = False
-        for parameter in message_text[1:]:
-            if parameter == 's' or parameter == 'с':
-                spoiler = True
-            if parameter == 'r' or parameter == 'р':
-                reply = True
-            if parameter == 'rr' or parameter == 'рр':
-                reverse_reply = True
-            if parameter == 'g' or parameter == 'к':
-                glue = True
-        if reverse_reply and tweet.get('quote', {}):
-            tweet_reply = tweet.get('quote', {})
-            link2 = tweet.get('quote', {}).get('url')
-            caption = await get_tweet_caption(tweet_reply, link2, spoiler)
-            sent = await send_tweet(
-                tweet_reply, message, caption, spoiler, glue, reply=False
-            )
-
-            caption = await get_tweet_caption(tweet, link, spoiler)
+        caption = await get_tweet_caption(tweet, link, spoiler)
+        await send_tweet(tweet, sent, caption, spoiler, glue, reply=True)
+    else:
+        caption = await get_tweet_caption(tweet, link, spoiler)
+        sent = await send_tweet(tweet, message, caption, spoiler, glue, reply=False)
+        if not sent:
+            return
+        if reply and tweet.get('quote', {}):
+            tweet = tweet.get('quote', {})
+            link2 = tweet.get('url')
+            caption = await get_tweet_caption(tweet, link2, spoiler)
             await send_tweet(tweet, sent, caption, spoiler, glue, reply=True)
-        else:
-            caption = await get_tweet_caption(tweet, link, spoiler)
-            sent = await send_tweet(tweet, message, caption, spoiler, glue, reply=False)
-            if reply and tweet.get('quote', {}):
-                tweet = tweet.get('quote', {})
-                link2 = tweet.get('url')
-                caption = await get_tweet_caption(tweet, link2, spoiler)
-                await send_tweet(tweet, sent, caption, spoiler, glue, reply=True)
+    try:
         await message.delete()
+    except TelegramAPIError:
+        pass
